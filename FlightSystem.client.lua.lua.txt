@@ -1,0 +1,1082 @@
+--[[
+	==========================================================
+	 SISTEMA DE VOO + LASER  (LocalScript)
+	 Coloque em: StarterPlayer > StarterPlayerScripts
+	----------------------------------------------------------
+	 Controles (PC):
+	   F           - Iniciar / parar voo
+	   W A S D     - Mover (relativo à câmera, inclui subir/descer olhando)
+	   Espaço      - Subir
+	   Ctrl Esq.   - Descer
+	   Shift Esq.  - Boost (velocidade máxima + VFX)
+	   E / Botão   - Disparar laser (mira no cursor)
+	 Celular: botões na tela (Voar, Laser, Boost, Subir, Descer)
+	==========================================================
+]]
+
+------------------------------------------------------------
+-- SERVIÇOS
+------------------------------------------------------------
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Debris           = game:GetService("Debris")
+local Workspace        = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+------------------------------------------------------------
+-- CONFIGURAÇÃO
+------------------------------------------------------------
+local CONFIG = {
+	-- Teclas
+	FLY_KEY    = Enum.KeyCode.F,
+	LASER_KEY  = Enum.KeyCode.E,
+	BOOST_KEY  = Enum.KeyCode.LeftShift,
+	UP_KEY     = Enum.KeyCode.Space,
+	DOWN_KEY   = Enum.KeyCode.LeftControl,
+
+	-- Movimento
+	BASE_SPEED      = 60,
+	BOOST_SPEED     = 150,
+	VERTICAL_SPEED  = 45,
+	ACCELERATION    = 3.5,   -- quanto maior, mais rápida a resposta
+	HOVER_AMPLITUDE = 1.2,   -- oscilação ao pairar
+	HOVER_FREQUENCY = 2,
+
+	-- Inclinação do corpo
+	TILT_MAX  = math.rad(70),  -- inclinação para frente
+	BANK_MAX  = math.rad(35),  -- inclinação lateral nas curvas
+	ORIENT_RESPONSIVENESS = 22,
+
+	-- Câmera
+	FOV_NORMAL = 70,
+	FOV_FLY    = 80,
+	FOV_BOOST  = 98,
+
+	-- Laser
+	LASER_RANGE    = 700,
+	LASER_COOLDOWN = 0.55,
+	LASER_DURATION = 0.4,
+	LASER_WIDTH    = 0.7,
+
+	-- Cores
+	COLOR_PRIMARY   = Color3.fromRGB(80, 200, 255),
+	COLOR_SECONDARY = Color3.fromRGB(190, 110, 255),
+	COLOR_BOOST     = Color3.fromRGB(255, 255, 255),
+	LASER_COLOR     = Color3.fromRGB(255, 50, 90),
+	LASER_CORE      = Color3.fromRGB(255, 230, 240),
+}
+
+-- Texturas embutidas do Roblox (não exigem upload)
+local TEX_SPARK = "rbxasset://textures/particles/sparkles_main.dds"
+local TEX_FIRE  = "rbxasset://textures/particles/fire_main.dds"
+local TEX_SMOKE = "rbxasset://textures/particles/smoke_main.dds"
+
+------------------------------------------------------------
+-- ESTADO
+------------------------------------------------------------
+local character, humanoid, rootPart
+local isFlying      = false
+local isBoosting    = false
+local verticalInput = 0
+local mobileUp, mobileDown = false, false
+local keyUp, keyDown = false, false
+
+local currentVelocity = Vector3.zero
+local currentBank     = 0
+local flightTime      = 0
+local lastLaserTime   = -math.huge
+local laserPoseTimer  = 0
+
+local shakeIntensity = 0
+local targetFov      = CONFIG.FOV_NORMAL
+
+local flightAttachment, linearVelocity, alignOrientation
+local motors = {}       -- [nome] = {motor = Motor6D, original = CFrame}
+local rigType = "R15"
+local vfx = { emitters = {}, trails = {}, instances = {}, jets = {}, light = nil, speedLines = nil, speedEmitter = nil }
+
+local ui = {}
+
+------------------------------------------------------------
+-- MÓDULO DE CONTROLES (suporta teclado, gamepad e touch)
+------------------------------------------------------------
+local controls
+pcall(function()
+	local playerModule = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+	controls = playerModule:GetControls()
+end)
+
+local function getMoveVector()
+	if controls then
+		return controls:GetMoveVector()
+	end
+	-- Alternativa manual caso o PlayerModule não esteja disponível
+	local v = Vector3.zero
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) then v += Vector3.new(0, 0, -1) end
+	if UserInputService:IsKeyDown(Enum.KeyCode.S) then v += Vector3.new(0, 0, 1) end
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then v += Vector3.new(-1, 0, 0) end
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then v += Vector3.new(1, 0, 0) end
+	return v.Magnitude > 0 and v.Unit or v
+end
+
+------------------------------------------------------------
+-- UTILIDADES
+------------------------------------------------------------
+local function smooth(speed, dt)
+	-- Fator de interpolação independente de FPS
+	return 1 - math.exp(-speed * dt)
+end
+
+local function tween(obj, time, props, style, direction)
+	local t = TweenService:Create(obj, TweenInfo.new(time, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out), props)
+	t:Play()
+	return t
+end
+
+local function findPart(names)
+	if not character then return nil end
+	for _, name in ipairs(names) do
+		local p = character:FindFirstChild(name)
+		if p then return p end
+	end
+	return nil
+end
+
+local function newEffectHolder(position)
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Transparency = 1
+	part.Size = Vector3.new(0.2, 0.2, 0.2)
+	part.CFrame = CFrame.new(position)
+	part.Parent = Workspace
+	return part
+end
+
+local function shake(amount)
+	shakeIntensity = math.max(shakeIntensity, amount)
+end
+
+local function colorSeq(a, b)
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0, a),
+		ColorSequenceKeypoint.new(1, b),
+	})
+end
+
+------------------------------------------------------------
+-- EFEITOS PONTUAIS (onda de choque, explosão)
+------------------------------------------------------------
+local function spawnShockwave(position, color, maxSize, duration)
+	duration = duration or 0.6
+	-- Anel achatado
+	local ring = Instance.new("Part")
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.CanQuery = false
+	ring.CanTouch = false
+	ring.Material = Enum.Material.Neon
+	ring.Color = color
+	ring.Transparency = 0.2
+	ring.Size = Vector3.new(0.3, 2, 2)
+	ring.CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.rad(90))
+	ring.Parent = Workspace
+	tween(ring, duration, { Size = Vector3.new(0.05, maxSize, maxSize), Transparency = 1 }, Enum.EasingStyle.Quint)
+
+	-- Esfera de impacto
+	local sphere = Instance.new("Part")
+	sphere.Shape = Enum.PartType.Ball
+	sphere.Anchored = true
+	sphere.CanCollide = false
+	sphere.CanQuery = false
+	sphere.CanTouch = false
+	sphere.Material = Enum.Material.ForceField
+	sphere.Color = color
+	sphere.Transparency = 0
+	sphere.Size = Vector3.new(1, 1, 1)
+	sphere.CFrame = CFrame.new(position)
+	sphere.Parent = Workspace
+	tween(sphere, duration * 0.8, { Size = Vector3.new(maxSize * 0.6, maxSize * 0.6, maxSize * 0.6), Transparency = 1 }, Enum.EasingStyle.Quint)
+
+	-- Faíscas
+	local holder = newEffectHolder(position)
+	local att = Instance.new("Attachment")
+	att.Parent = holder
+	local burst = Instance.new("ParticleEmitter")
+	burst.Texture = TEX_SPARK
+	burst.Color = colorSeq(CONFIG.COLOR_BOOST, color)
+	burst.LightEmission = 1
+	burst.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.2), NumberSequenceKeypoint.new(1, 0) })
+	burst.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
+	burst.Lifetime = NumberRange.new(0.4, 0.8)
+	burst.Speed = NumberRange.new(20, 45)
+	burst.SpreadAngle = Vector2.new(180, 180)
+	burst.Drag = 5
+	burst.Rate = 0
+	burst.Parent = att
+	burst:Emit(45)
+
+	Debris:AddItem(ring, duration + 0.1)
+	Debris:AddItem(sphere, duration + 0.1)
+	Debris:AddItem(holder, 1.2)
+end
+
+------------------------------------------------------------
+-- ANIMAÇÃO PROCEDURAL (Motor6D)
+------------------------------------------------------------
+local R15_JOINTS = { "Waist", "Neck", "RightShoulder", "LeftShoulder", "RightElbow", "LeftElbow", "RightHip", "LeftHip", "RightKnee", "LeftKnee" }
+local R6_JOINTS  = { "Neck", "Right Shoulder", "Left Shoulder", "Right Hip", "Left Hip" }
+
+local function cacheMotors()
+	motors = {}
+	if not character then return end
+	local list = (rigType == "R15") and R15_JOINTS or R6_JOINTS
+	for _, desc in ipairs(character:GetDescendants()) do
+		if desc:IsA("Motor6D") and table.find(list, desc.Name) then
+			motors[desc.Name] = { motor = desc, original = desc.C0 }
+		end
+	end
+end
+
+local function setPose(name, offset, alpha)
+	local data = motors[name]
+	if data and data.motor.Parent then
+		data.motor.C0 = data.motor.C0:Lerp(data.original * offset, alpha)
+	end
+end
+
+local function restoreMotors()
+	for _, data in pairs(motors) do
+		if data.motor.Parent then
+			data.motor.C0 = data.original
+		end
+	end
+end
+
+local function updateAnimation(dt)
+	local speed      = currentVelocity.Magnitude
+	local moveAlpha  = math.clamp(speed / CONFIG.BASE_SPEED, 0, 1)
+	local boostAlpha = isBoosting and math.clamp(speed / CONFIG.BOOST_SPEED, 0, 1) or 0
+	local t          = flightTime
+	local breath     = math.sin(t * CONFIG.HOVER_FREQUENCY * 1.5)
+	local a          = smooth(10, dt)
+	local laserActive = laserPoseTimer > 0
+
+	if rigType == "R15" then
+		-- Tronco: respira ao pairar, arqueia no movimento
+		setPose("Waist", CFrame.Angles(breath * 0.04 + moveAlpha * 0.15, 0, -currentBank * 0.35), a)
+		-- Cabeça: olha para frente quando o corpo inclina
+		setPose("Neck", CFrame.Angles(moveAlpha * 0.55 + boostAlpha * 0.25, 0, currentBank * 0.2), a)
+
+		-- Braço direito: pairar -> aberto | voando -> para trás | boost -> "super-herói" | laser -> mirando
+		local rShoulder
+		if laserActive then
+			rShoulder = CFrame.Angles(math.rad(95) + moveAlpha * 0.9, 0, 0)
+		else
+			local hover = CFrame.Angles(0.15 + breath * 0.06, 0, 0.3 + breath * 0.04)
+			local fly   = CFrame.Angles(-0.45, 0, 0.18)
+			local boost = CFrame.Angles(math.rad(165), 0, -0.1)
+			rShoulder = hover:Lerp(fly, moveAlpha):Lerp(boost, boostAlpha)
+		end
+		setPose("RightShoulder", rShoulder, laserActive and smooth(30, dt) or a)
+
+		local lHover = CFrame.Angles(0.15 - breath * 0.06, 0, -0.3 - breath * 0.04)
+		local lFly   = CFrame.Angles(-0.45, 0, -0.18)
+		local lBoost = CFrame.Angles(-0.6, 0, -0.12)
+		setPose("LeftShoulder", lHover:Lerp(lFly, moveAlpha):Lerp(lBoost, boostAlpha), a)
+
+		setPose("RightElbow", CFrame.Angles(0.35 * (1 - moveAlpha) + (laserActive and -0.3 or 0), 0, 0), a)
+		setPose("LeftElbow",  CFrame.Angles(0.35 * (1 - moveAlpha), 0, 0), a)
+
+		-- Pernas: dobradas ao pairar (balanço suave), estendidas no voo
+		local legSwing = math.sin(t * 2.2) * 0.08 * (1 - moveAlpha)
+		setPose("RightHip",  CFrame.Angles(0.25 * (1 - moveAlpha) + legSwing - moveAlpha * 0.15, 0, 0), a)
+		setPose("LeftHip",   CFrame.Angles(0.45 * (1 - moveAlpha) - legSwing - moveAlpha * 0.05, 0, 0), a)
+		setPose("RightKnee", CFrame.Angles(-0.35 * (1 - moveAlpha) - 0.05, 0, 0), a)
+		setPose("LeftKnee",  CFrame.Angles(-0.7 * (1 - moveAlpha) - 0.15 * moveAlpha, 0, 0), a)
+	else
+		-- R6: articulações giram no eixo Z local
+		local swing = math.sin(t * 2.2) * 0.1 * (1 - moveAlpha)
+		local rArm = laserActive and math.rad(90) or (0.2 + breath * 0.05) * (1 - moveAlpha) - moveAlpha * 0.5 + boostAlpha * math.rad(200)
+		setPose("Right Shoulder", CFrame.Angles(0, 0, rArm), laserActive and smooth(30, dt) or a)
+		setPose("Left Shoulder",  CFrame.Angles(0, 0, -((0.2 + breath * 0.05) * (1 - moveAlpha) - moveAlpha * 0.5)), a)
+		setPose("Right Hip",      CFrame.Angles(0, 0, 0.2 * (1 - moveAlpha) + swing), a)
+		setPose("Left Hip",       CFrame.Angles(0, 0, -(0.4 * (1 - moveAlpha) - swing)), a)
+		setPose("Neck",           CFrame.Angles(-moveAlpha * 0.5, 0, 0), a)
+	end
+end
+
+------------------------------------------------------------
+-- VFX DE VOO (aura, rastros, jatos, luz, linhas de velocidade)
+------------------------------------------------------------
+local function trackVfx(instance)
+	table.insert(vfx.instances, instance)
+	return instance
+end
+
+local function createTrail(part, offsetA, offsetB, width)
+	if not part then return end
+	local a0 = trackVfx(Instance.new("Attachment"))
+	a0.Position = offsetA
+	a0.Parent = part
+	local a1 = trackVfx(Instance.new("Attachment"))
+	a1.Position = offsetB
+	a1.Parent = part
+
+	local trail = trackVfx(Instance.new("Trail"))
+	trail.Attachment0 = a0
+	trail.Attachment1 = a1
+	trail.Color = colorSeq(CONFIG.COLOR_PRIMARY, CONFIG.COLOR_SECONDARY)
+	trail.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.1),
+		NumberSequenceKeypoint.new(0.6, 0.6),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	trail.WidthScale = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, width or 1),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	trail.LightEmission = 1
+	trail.Lifetime = 0.35
+	trail.MinLength = 0.05
+	trail.FaceCamera = true
+	trail.Enabled = false
+	trail.Parent = part
+	table.insert(vfx.trails, trail)
+end
+
+local function createFlightVFX()
+	-- Aura de energia ao redor do corpo
+	local auraAtt = trackVfx(Instance.new("Attachment"))
+	auraAtt.Parent = rootPart
+
+	local aura = trackVfx(Instance.new("ParticleEmitter"))
+	aura.Texture = TEX_SPARK
+	aura.Color = colorSeq(CONFIG.COLOR_PRIMARY, CONFIG.COLOR_SECONDARY)
+	aura.LightEmission = 1
+	aura.LightInfluence = 0
+	aura.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(0.5, 0.9), NumberSequenceKeypoint.new(1, 0) })
+	aura.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1) })
+	aura.Lifetime = NumberRange.new(0.5, 1.1)
+	aura.Speed = NumberRange.new(1, 3)
+	aura.SpreadAngle = Vector2.new(180, 180)
+	aura.Rotation = NumberRange.new(0, 360)
+	aura.RotSpeed = NumberRange.new(-120, 120)
+	aura.Rate = 30
+	aura.Parent = auraAtt
+	table.insert(vfx.emitters, aura)
+
+	-- Brilho suave (fumaça luminosa)
+	local glow = trackVfx(Instance.new("ParticleEmitter"))
+	glow.Texture = TEX_SMOKE
+	glow.Color = colorSeq(CONFIG.COLOR_PRIMARY, CONFIG.COLOR_SECONDARY)
+	glow.LightEmission = 0.8
+	glow.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2.5), NumberSequenceKeypoint.new(1, 4) })
+	glow.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.85), NumberSequenceKeypoint.new(1, 1) })
+	glow.Lifetime = NumberRange.new(0.6, 0.9)
+	glow.Speed = NumberRange.new(0, 0.5)
+	glow.LockedToPart = true
+	glow.Rate = 12
+	glow.Parent = auraAtt
+	table.insert(vfx.emitters, glow)
+
+	-- Luz dinâmica
+	local light = trackVfx(Instance.new("PointLight"))
+	light.Color = CONFIG.COLOR_PRIMARY
+	light.Brightness = 2
+	light.Range = 14
+	light.Shadows = false
+	light.Parent = rootPart
+	vfx.light = light
+
+	-- Rastros nas mãos e pés
+	local rightHand = findPart({ "RightHand", "Right Arm" })
+	local leftHand  = findPart({ "LeftHand", "Left Arm" })
+	local rightFoot = findPart({ "RightFoot", "Right Leg" })
+	local leftFoot  = findPart({ "LeftFoot", "Left Leg" })
+	local handOff = (rigType == "R15") and 0.25 or 0.9
+	createTrail(rightHand, Vector3.new(0, handOff, 0), Vector3.new(0, -handOff, 0), 0.8)
+	createTrail(leftHand,  Vector3.new(0, handOff, 0), Vector3.new(0, -handOff, 0), 0.8)
+	createTrail(rightFoot, Vector3.new(0.25, 0, 0), Vector3.new(-0.25, 0, 0), 1)
+	createTrail(leftFoot,  Vector3.new(0.25, 0, 0), Vector3.new(-0.25, 0, 0), 1)
+
+	-- Jatos de energia saindo dos pés
+	local footY = (rigType == "R15") and -0.3 or -1
+	for _, foot in ipairs({ rightFoot, leftFoot }) do
+		if foot then
+			local att = trackVfx(Instance.new("Attachment"))
+			att.Position = Vector3.new(0, footY, 0)
+			att.Parent = foot
+
+			local jet = trackVfx(Instance.new("ParticleEmitter"))
+			jet.Texture = TEX_FIRE
+			jet.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, CONFIG.COLOR_BOOST),
+				ColorSequenceKeypoint.new(0.3, CONFIG.COLOR_PRIMARY),
+				ColorSequenceKeypoint.new(1, CONFIG.COLOR_SECONDARY),
+			})
+			jet.LightEmission = 1
+			jet.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.7), NumberSequenceKeypoint.new(1, 0) })
+			jet.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 1) })
+			jet.Lifetime = NumberRange.new(0.15, 0.3)
+			jet.Speed = NumberRange.new(8, 14)
+			jet.EmissionDirection = Enum.NormalId.Bottom
+			jet.SpreadAngle = Vector2.new(12, 12)
+			jet.Rate = 40
+			jet.Parent = att
+			table.insert(vfx.emitters, jet)
+			table.insert(vfx.jets, jet)
+		end
+	end
+
+	-- Linhas de velocidade na frente da câmera
+	local lines = Instance.new("Part")
+	lines.Name = "SpeedLines"
+	lines.Anchored = true
+	lines.CanCollide = false
+	lines.CanQuery = false
+	lines.CanTouch = false
+	lines.Transparency = 1
+	lines.Size = Vector3.new(40, 26, 1)
+	lines.Parent = Workspace
+	trackVfx(lines)
+	vfx.speedLines = lines
+
+	local speedEmitter = Instance.new("ParticleEmitter")
+	speedEmitter.Texture = TEX_SPARK
+	speedEmitter.Color = ColorSequence.new(Color3.new(1, 1, 1))
+	speedEmitter.LightEmission = 1
+	speedEmitter.Size = NumberSequence.new(0.12)
+	speedEmitter.Squash = NumberSequence.new(-2.5)
+	speedEmitter.Orientation = Enum.ParticleOrientation.VelocityParallel
+	speedEmitter.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.3, 0.4), NumberSequenceKeypoint.new(1, 1) })
+	speedEmitter.Lifetime = NumberRange.new(0.2, 0.3)
+	speedEmitter.Speed = NumberRange.new(90, 130)
+	speedEmitter.EmissionDirection = Enum.NormalId.Back
+	speedEmitter.Shape = Enum.ParticleEmitterShape.Box
+	speedEmitter.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume
+	speedEmitter.LockedToPart = true
+	speedEmitter.Rate = 0
+	speedEmitter.Parent = lines
+	vfx.speedEmitter = speedEmitter
+end
+
+local function destroyFlightVFX()
+	for _, emitter in ipairs(vfx.emitters) do
+		if emitter.Parent then emitter.Enabled = false end
+	end
+	for _, trail in ipairs(vfx.trails) do
+		if trail.Parent then trail.Enabled = false end
+	end
+	if vfx.speedEmitter then vfx.speedEmitter.Enabled = false end
+	if vfx.light and vfx.light.Parent then
+		tween(vfx.light, 0.4, { Brightness = 0 })
+	end
+	-- Remove depois que as partículas terminam de sumir
+	for _, inst in ipairs(vfx.instances) do
+		Debris:AddItem(inst, 1.2)
+	end
+	vfx = { emitters = {}, trails = {}, instances = {}, jets = {}, light = nil, speedLines = nil, speedEmitter = nil }
+end
+
+local function updateVFX(dt)
+	local speed = currentVelocity.Magnitude
+	local speedAlpha = math.clamp(speed / CONFIG.BOOST_SPEED, 0, 1)
+
+	for _, trail in ipairs(vfx.trails) do
+		trail.Enabled = speed > 12
+		trail.Lifetime = 0.2 + speedAlpha * 0.35
+	end
+
+	for _, jet in ipairs(vfx.jets) do
+		jet.Rate = 30 + speedAlpha * 120
+		jet.Speed = NumberRange.new(8 + speedAlpha * 20, 14 + speedAlpha * 30)
+	end
+
+	if vfx.light then
+		local target = isBoosting and 4 or 2
+		vfx.light.Brightness += (target + math.sin(flightTime * 8) * 0.3 - vfx.light.Brightness) * smooth(6, dt)
+		vfx.light.Color = isBoosting and CONFIG.COLOR_BOOST:Lerp(CONFIG.COLOR_PRIMARY, 0.5) or CONFIG.COLOR_PRIMARY
+	end
+
+	if vfx.speedLines and vfx.speedEmitter then
+		vfx.speedLines.CFrame = camera.CFrame * CFrame.new(0, 0, -22)
+		local lineAlpha = math.clamp((speed - CONFIG.BASE_SPEED * 0.8) / (CONFIG.BOOST_SPEED - CONFIG.BASE_SPEED * 0.8), 0, 1)
+		vfx.speedEmitter.Rate = lineAlpha * 160
+	end
+end
+
+------------------------------------------------------------
+-- FÍSICA DE VOO
+------------------------------------------------------------
+local function updateFlight(dt)
+	if not rootPart or not rootPart.Parent then return end
+	flightTime += dt
+
+	-- Entrada
+	local move = getMoveVector()                         -- espaço local da câmera
+	verticalInput = ((keyUp or mobileUp) and 1 or 0) - ((keyDown or mobileDown) and 1 or 0)
+
+	local camCF = camera.CFrame
+	local worldDir = camCF:VectorToWorldSpace(move)      -- inclui a inclinação da câmera
+	local maxSpeed = isBoosting and CONFIG.BOOST_SPEED or CONFIG.BASE_SPEED
+
+	local target = Vector3.zero
+	if worldDir.Magnitude > 0.01 then
+		target = worldDir.Unit * maxSpeed * math.min(move.Magnitude, 1)
+	end
+	target += Vector3.new(0, verticalInput * CONFIG.VERTICAL_SPEED, 0)
+
+	-- Oscilação ao pairar
+	local idle = target.Magnitude < 1
+	if idle then
+		target += Vector3.new(0, math.cos(flightTime * CONFIG.HOVER_FREQUENCY) * CONFIG.HOVER_AMPLITUDE, 0)
+	end
+
+	currentVelocity = currentVelocity:Lerp(target, smooth(CONFIG.ACCELERATION, dt))
+	linearVelocity.VectorVelocity = currentVelocity
+
+	-- Orientação: encara a direção do movimento, inclina para frente e lateralmente
+	local flatLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+	local horizontal = Vector3.new(currentVelocity.X, 0, currentVelocity.Z)
+	local facing = (horizontal.Magnitude > 5) and horizontal.Unit or (flatLook.Magnitude > 0 and flatLook.Unit or Vector3.new(0, 0, -1))
+
+	local speedAlpha = math.clamp(horizontal.Magnitude / CONFIG.BASE_SPEED, 0, 1)
+	local tilt = speedAlpha * CONFIG.TILT_MAX * (isBoosting and 1 or 0.8)
+	-- Ajusta inclinação ao subir/descer em diagonal
+	tilt -= math.clamp(currentVelocity.Y / CONFIG.BOOST_SPEED, -0.5, 0.5) * speedAlpha * 0.6
+
+	local targetBank = -move.X * CONFIG.BANK_MAX * math.max(speedAlpha, 0.3)
+	currentBank += (targetBank - currentBank) * smooth(5, dt)
+
+	local base = CFrame.lookAt(rootPart.Position, rootPart.Position + facing)
+	alignOrientation.CFrame = base * CFrame.Angles(-tilt, 0, currentBank)
+
+	-- FOV dinâmico
+	targetFov = isBoosting and CONFIG.FOV_BOOST or (CONFIG.FOV_FLY + speedAlpha * 5)
+
+	-- Tremor leve em velocidade máxima
+	if isBoosting and currentVelocity.Magnitude > CONFIG.BOOST_SPEED * 0.8 then
+		shake(0.08)
+	end
+end
+
+------------------------------------------------------------
+-- INICIAR / PARAR VOO
+------------------------------------------------------------
+local updateUI -- declarado adiante
+
+local function startFlight()
+	if isFlying or not rootPart or not humanoid or humanoid.Health <= 0 then return end
+	isFlying = true
+	flightTime = 0
+	currentBank = 0
+
+	humanoid.PlatformStand = true -- desativa as animações padrão e o controle do Humanoid
+
+	flightAttachment = Instance.new("Attachment")
+	flightAttachment.Name = "FlightAttachment"
+	flightAttachment.Parent = rootPart
+
+	linearVelocity = Instance.new("LinearVelocity")
+	linearVelocity.Attachment0 = flightAttachment
+	linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	linearVelocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	linearVelocity.MaxForce = math.huge
+	linearVelocity.Parent = rootPart
+
+	alignOrientation = Instance.new("AlignOrientation")
+	alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	alignOrientation.Attachment0 = flightAttachment
+	alignOrientation.MaxTorque = math.huge
+	alignOrientation.Responsiveness = CONFIG.ORIENT_RESPONSIVENESS
+	alignOrientation.CFrame = rootPart.CFrame
+	alignOrientation.Parent = rootPart
+
+	-- Impulso de decolagem
+	currentVelocity = rootPart.AssemblyLinearVelocity + Vector3.new(0, 30, 0)
+
+	cacheMotors()
+	createFlightVFX()
+	spawnShockwave(rootPart.Position - Vector3.new(0, 2.8, 0), CONFIG.COLOR_PRIMARY, 26, 0.7)
+	shake(0.5)
+	targetFov = CONFIG.FOV_FLY
+	updateUI()
+end
+
+local function stopFlight()
+	if not isFlying then return end
+	isFlying = false
+	isBoosting = false
+
+	if linearVelocity then linearVelocity:Destroy() end
+	if alignOrientation then alignOrientation:Destroy() end
+	if flightAttachment then flightAttachment:Destroy() end
+	linearVelocity, alignOrientation, flightAttachment = nil, nil, nil
+
+	restoreMotors()
+	destroyFlightVFX()
+
+	if humanoid and humanoid.Parent then
+		humanoid.PlatformStand = false
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+	if rootPart and rootPart.Parent then
+		-- Mantém parte do impulso para uma saída natural
+		rootPart.AssemblyLinearVelocity = currentVelocity * 0.4
+		spawnShockwave(rootPart.Position, CONFIG.COLOR_SECONDARY, 16, 0.5)
+	end
+	currentVelocity = Vector3.zero
+	targetFov = CONFIG.FOV_NORMAL
+	updateUI()
+end
+
+local function toggleFlight()
+	if isFlying then stopFlight() else startFlight() end
+end
+
+local function setBoost(state)
+	if not isFlying then
+		isBoosting = false
+		updateUI()
+		return
+	end
+	if state and not isBoosting and rootPart then
+		-- Explosão sônica ao ativar o boost
+		spawnShockwave(rootPart.Position, CONFIG.COLOR_BOOST, 20, 0.45)
+		shake(0.6)
+	end
+	isBoosting = state
+	updateUI()
+end
+
+------------------------------------------------------------
+-- LASER
+------------------------------------------------------------
+local function getAimRay()
+	local x, y
+	if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+		-- Celular: mira no centro da tela
+		x, y = camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2
+	else
+		local m = UserInputService:GetMouseLocation()
+		x, y = m.X, m.Y
+	end
+	return camera:ViewportPointToRay(x, y)
+end
+
+local function createLaserPart(color, material, transparency, width, length, cf)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Cylinder
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Material = material
+	p.Color = color
+	p.Transparency = transparency
+	p.Size = Vector3.new(length, width, width)
+	p.CFrame = cf
+	p.Parent = Workspace
+	return p
+end
+
+local function laserImpact(position, normal)
+	local holder = newEffectHolder(position)
+	holder.CFrame = CFrame.lookAt(position, position + normal)
+	local att = Instance.new("Attachment")
+	att.Parent = holder
+
+	local sparks = Instance.new("ParticleEmitter")
+	sparks.Texture = TEX_SPARK
+	sparks.Color = colorSeq(CONFIG.LASER_CORE, CONFIG.LASER_COLOR)
+	sparks.LightEmission = 1
+	sparks.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.8), NumberSequenceKeypoint.new(1, 0) })
+	sparks.Lifetime = NumberRange.new(0.3, 0.7)
+	sparks.Speed = NumberRange.new(25, 55)
+	sparks.SpreadAngle = Vector2.new(70, 70)
+	sparks.EmissionDirection = Enum.NormalId.Back -- -Z local = sentido da normal
+	sparks.Acceleration = Vector3.new(0, -60, 0)
+	sparks.Drag = 2
+	sparks.Rate = 0
+	sparks.Parent = att
+	sparks:Emit(50)
+
+	local fire = Instance.new("ParticleEmitter")
+	fire.Texture = TEX_FIRE
+	fire.Color = colorSeq(CONFIG.LASER_CORE, CONFIG.LASER_COLOR)
+	fire.LightEmission = 1
+	fire.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 3), NumberSequenceKeypoint.new(1, 6) })
+	fire.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1) })
+	fire.Lifetime = NumberRange.new(0.25, 0.45)
+	fire.Speed = NumberRange.new(2, 6)
+	fire.SpreadAngle = Vector2.new(180, 180)
+	fire.Rate = 0
+	fire.Parent = att
+	fire:Emit(18)
+
+	local smoke = Instance.new("ParticleEmitter")
+	smoke.Texture = TEX_SMOKE
+	smoke.Color = ColorSequence.new(Color3.fromRGB(60, 40, 50))
+	smoke.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2), NumberSequenceKeypoint.new(1, 7) })
+	smoke.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 1) })
+	smoke.Lifetime = NumberRange.new(0.8, 1.4)
+	smoke.Speed = NumberRange.new(3, 7)
+	smoke.SpreadAngle = Vector2.new(60, 60)
+	smoke.EmissionDirection = Enum.NormalId.Back
+	smoke.Rate = 0
+	smoke.Parent = att
+	smoke:Emit(10)
+
+	local light = Instance.new("PointLight")
+	light.Color = CONFIG.LASER_COLOR
+	light.Brightness = 8
+	light.Range = 22
+	light.Parent = holder
+	tween(light, 0.5, { Brightness = 0 })
+
+	-- Clarão esférico
+	local flash = Instance.new("Part")
+	flash.Shape = Enum.PartType.Ball
+	flash.Anchored = true
+	flash.CanCollide = false
+	flash.CanQuery = false
+	flash.CanTouch = false
+	flash.Material = Enum.Material.Neon
+	flash.Color = CONFIG.LASER_CORE
+	flash.Size = Vector3.new(1, 1, 1)
+	flash.CFrame = CFrame.new(position)
+	flash.Parent = Workspace
+	tween(flash, 0.3, { Size = Vector3.new(7, 7, 7), Transparency = 1, Color = CONFIG.LASER_COLOR }, Enum.EasingStyle.Quint)
+
+	spawnShockwave(position, CONFIG.LASER_COLOR, 14, 0.4)
+
+	Debris:AddItem(flash, 0.4)
+	Debris:AddItem(holder, 1.6)
+end
+
+local function fireLaser()
+	if not rootPart or not humanoid or humanoid.Health <= 0 then return end
+	local now = os.clock()
+	if now - lastLaserTime < CONFIG.LASER_COOLDOWN then return end
+	lastLaserTime = now
+
+	local hand = findPart({ "RightHand", "Right Arm" }) or rootPart
+	local origin = hand.Position
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+
+	-- 1) Descobre o ponto mirado pela câmera
+	local aimRay = getAimRay()
+	local aimHit = Workspace:Raycast(aimRay.Origin, aimRay.Direction * CONFIG.LASER_RANGE, params)
+	local aimPoint = aimHit and aimHit.Position or (aimRay.Origin + aimRay.Direction * CONFIG.LASER_RANGE)
+
+	-- 2) Raio real da mão até o alvo (pode ser bloqueado no caminho)
+	local dir = aimPoint - origin
+	if dir.Magnitude < 0.1 then dir = camera.CFrame.LookVector end
+	local result = Workspace:Raycast(origin, dir.Unit * CONFIG.LASER_RANGE, params)
+	local endPoint = result and result.Position or (origin + dir.Unit * CONFIG.LASER_RANGE)
+	local length = (endPoint - origin).Magnitude
+
+	laserPoseTimer = CONFIG.LASER_DURATION + 0.15
+
+	-- Raio: núcleo branco + camada colorida + halo
+	local cf = CFrame.lookAt(origin, endPoint) * CFrame.new(0, 0, -length / 2) * CFrame.Angles(0, math.rad(90), 0)
+	local w = CONFIG.LASER_WIDTH
+	local core  = createLaserPart(CONFIG.LASER_CORE, Enum.Material.Neon, 0, w * 0.45, length, cf)
+	local beam  = createLaserPart(CONFIG.LASER_COLOR, Enum.Material.Neon, 0.25, w, length, cf)
+	local halo  = createLaserPart(CONFIG.LASER_COLOR, Enum.Material.ForceField, 0.1, w * 3, length, cf)
+
+	-- Pulso de abertura (o raio "engrossa" e depois afina)
+	beam.Size = Vector3.new(length, w * 2, w * 2)
+	tween(beam, CONFIG.LASER_DURATION, { Size = Vector3.new(length, 0, 0), Transparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	tween(core, CONFIG.LASER_DURATION, { Size = Vector3.new(length, 0, 0) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	tween(halo, CONFIG.LASER_DURATION * 0.8, { Size = Vector3.new(length, w * 5, w * 5), Transparency = 1 })
+
+	-- Clarão na mão (boca do disparo)
+	local muzzle = newEffectHolder(origin)
+	local mAtt = Instance.new("Attachment")
+	mAtt.Parent = muzzle
+	local mFlash = Instance.new("ParticleEmitter")
+	mFlash.Texture = TEX_SPARK
+	mFlash.Color = colorSeq(CONFIG.LASER_CORE, CONFIG.LASER_COLOR)
+	mFlash.LightEmission = 1
+	mFlash.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2.5), NumberSequenceKeypoint.new(1, 0) })
+	mFlash.Lifetime = NumberRange.new(0.15, 0.25)
+	mFlash.Speed = NumberRange.new(4, 10)
+	mFlash.SpreadAngle = Vector2.new(180, 180)
+	mFlash.Rate = 0
+	mFlash.Parent = mAtt
+	mFlash:Emit(20)
+	local mLight = Instance.new("PointLight")
+	mLight.Color = CONFIG.LASER_COLOR
+	mLight.Brightness = 6
+	mLight.Range = 14
+	mLight.Parent = muzzle
+	tween(mLight, 0.35, { Brightness = 0 })
+
+	if result then
+		laserImpact(result.Position, result.Normal)
+	end
+
+	shake(0.45)
+	targetFov = targetFov - 4 -- "soco" rápido de FOV (volta suavemente)
+
+	-- Ponto de integração com o servidor (dano real precisa de RemoteEvent)
+	-- Ex.: LaserRemote:FireServer(origin, endPoint)
+
+	Debris:AddItem(core, CONFIG.LASER_DURATION + 0.05)
+	Debris:AddItem(beam, CONFIG.LASER_DURATION + 0.05)
+	Debris:AddItem(halo, CONFIG.LASER_DURATION + 0.05)
+	Debris:AddItem(muzzle, 0.6)
+
+	updateUI()
+end
+
+------------------------------------------------------------
+-- INTERFACE
+------------------------------------------------------------
+local function styleButton(btn, color)
+	btn.AutoButtonColor = false
+	btn.BackgroundColor3 = Color3.fromRGB(18, 20, 32)
+	btn.BackgroundTransparency = 0.15
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.Font = Enum.Font.GothamBold
+	btn.TextScaled = true
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 14)
+	corner.Parent = btn
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color
+	stroke.Thickness = 2
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = btn
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0.2, 0)
+	pad.PaddingBottom = UDim.new(0.2, 0)
+	pad.Parent = btn
+
+	local gradient = Instance.new("UIGradient")
+	gradient.Color = colorSeq(Color3.new(1, 1, 1), Color3.fromRGB(170, 170, 200))
+	gradient.Rotation = 90
+	gradient.Parent = btn
+
+	local baseSize = btn.Size
+	btn.MouseEnter:Connect(function()
+		tween(btn, 0.15, { BackgroundTransparency = 0 })
+		tween(stroke, 0.15, { Thickness = 3 })
+	end)
+	btn.MouseLeave:Connect(function()
+		tween(btn, 0.15, { BackgroundTransparency = 0.15, Size = baseSize })
+		tween(stroke, 0.15, { Thickness = 2 })
+	end)
+	btn.MouseButton1Down:Connect(function()
+		tween(btn, 0.08, { Size = UDim2.new(baseSize.X.Scale * 0.94, baseSize.X.Offset * 0.94, baseSize.Y.Scale * 0.94, baseSize.Y.Offset * 0.94) })
+	end)
+	btn.MouseButton1Up:Connect(function()
+		tween(btn, 0.12, { Size = baseSize }, Enum.EasingStyle.Back)
+	end)
+	return stroke
+end
+
+local function makeButton(parent, text, size, position, color)
+	local btn = Instance.new("TextButton")
+	btn.Text = text
+	btn.Size = size
+	btn.Position = position
+	btn.AnchorPoint = Vector2.new(1, 1)
+	btn.Parent = parent
+	local stroke = styleButton(btn, color)
+	return btn, stroke
+end
+
+local function buildUI()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "FlightUI"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = player:WaitForChild("PlayerGui")
+	ui.gui = gui
+
+	ui.flyButton, ui.flyStroke = makeButton(gui, "VOAR [F]", UDim2.fromOffset(150, 52), UDim2.new(1, -20, 1, -150), CONFIG.COLOR_PRIMARY)
+	ui.laserButton, ui.laserStroke = makeButton(gui, "LASER [E]", UDim2.fromOffset(150, 52), UDim2.new(1, -20, 1, -88), CONFIG.LASER_COLOR)
+
+	-- Barra de recarga do laser
+	local cdBack = Instance.new("Frame")
+	cdBack.Size = UDim2.new(1, -20, 0, 4)
+	cdBack.Position = UDim2.new(0, 10, 1, -8)
+	cdBack.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+	cdBack.BorderSizePixel = 0
+	cdBack.Parent = ui.laserButton
+	local cdFill = Instance.new("Frame")
+	cdFill.Size = UDim2.fromScale(1, 1)
+	cdFill.BackgroundColor3 = CONFIG.LASER_COLOR
+	cdFill.BorderSizePixel = 0
+	cdFill.Parent = cdBack
+	ui.cooldownFill = cdFill
+
+	-- Texto de status
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.fromOffset(260, 26)
+	status.Position = UDim2.new(1, -20, 1, -210)
+	status.AnchorPoint = Vector2.new(1, 1)
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.GothamMedium
+	status.TextScaled = true
+	status.TextXAlignment = Enum.TextXAlignment.Right
+	status.TextColor3 = Color3.fromRGB(200, 220, 255)
+	status.TextStrokeTransparency = 0.6
+	status.Parent = gui
+	ui.status = status
+
+	ui.flyButton.MouseButton1Click:Connect(toggleFlight)
+	ui.laserButton.MouseButton1Click:Connect(fireLaser)
+
+	-- Controles extras para celular
+	if UserInputService.TouchEnabled then
+		local up = makeButton(gui, "▲", UDim2.fromOffset(60, 60), UDim2.new(1, -180, 1, -150), CONFIG.COLOR_PRIMARY)
+		local down = makeButton(gui, "▼", UDim2.fromOffset(60, 60), UDim2.new(1, -180, 1, -82), CONFIG.COLOR_PRIMARY)
+		local boost = makeButton(gui, "BOOST", UDim2.fromOffset(150, 46), UDim2.new(1, -20, 1, -260), CONFIG.COLOR_SECONDARY)
+
+		up.MouseButton1Down:Connect(function() mobileUp = true end)
+		up.MouseButton1Up:Connect(function() mobileUp = false end)
+		up.MouseLeave:Connect(function() mobileUp = false end)
+		down.MouseButton1Down:Connect(function() mobileDown = true end)
+		down.MouseButton1Up:Connect(function() mobileDown = false end)
+		down.MouseLeave:Connect(function() mobileDown = false end)
+		boost.MouseButton1Click:Connect(function() setBoost(not isBoosting) end)
+	end
+end
+
+updateUI = function()
+	if not ui.flyButton then return end
+	if isFlying then
+		ui.flyButton.Text = "POUSAR [F]"
+		ui.flyStroke.Color = CONFIG.COLOR_SECONDARY
+		ui.status.Text = isBoosting and "⚡ BOOST ATIVO" or "✈ Voando"
+	else
+		ui.flyButton.Text = "VOAR [F]"
+		ui.flyStroke.Color = CONFIG.COLOR_PRIMARY
+		ui.status.Text = ""
+	end
+end
+
+local function updateCooldownBar()
+	if not ui.cooldownFill then return end
+	local alpha = math.clamp((os.clock() - lastLaserTime) / CONFIG.LASER_COOLDOWN, 0, 1)
+	ui.cooldownFill.Size = UDim2.fromScale(alpha, 1)
+end
+
+------------------------------------------------------------
+-- ENTRADA
+------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	local key = input.KeyCode
+	if key == CONFIG.FLY_KEY then
+		toggleFlight()
+	elseif key == CONFIG.LASER_KEY then
+		fireLaser()
+	elseif key == CONFIG.BOOST_KEY then
+		setBoost(true)
+	elseif key == CONFIG.UP_KEY then
+		keyUp = true
+	elseif key == CONFIG.DOWN_KEY then
+		keyDown = true
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	local key = input.KeyCode
+	if key == CONFIG.BOOST_KEY then
+		setBoost(false)
+	elseif key == CONFIG.UP_KEY then
+		keyUp = false
+	elseif key == CONFIG.DOWN_KEY then
+		keyDown = false
+	end
+end)
+
+------------------------------------------------------------
+-- PERSONAGEM (spawn / respawn)
+------------------------------------------------------------
+local function onCharacterAdded(newCharacter)
+	if isFlying then
+		isFlying = false
+		destroyFlightVFX()
+	end
+	isBoosting = false
+	character = newCharacter
+	humanoid = newCharacter:WaitForChild("Humanoid")
+	rootPart = newCharacter:WaitForChild("HumanoidRootPart")
+	rigType = (humanoid.RigType == Enum.HumanoidRigType.R15) and "R15" or "R6"
+	motors = {}
+	currentVelocity = Vector3.zero
+	targetFov = CONFIG.FOV_NORMAL
+
+	humanoid.Died:Connect(function()
+		stopFlight()
+	end)
+	updateUI()
+end
+
+------------------------------------------------------------
+-- LOOP PRINCIPAL
+------------------------------------------------------------
+RunService.RenderStepped:Connect(function(dt)
+	-- Voo
+	if isFlying and linearVelocity and alignOrientation then
+		updateFlight(dt)
+		updateAnimation(dt)
+		updateVFX(dt)
+	end
+
+	if laserPoseTimer > 0 then
+		laserPoseTimer -= dt
+	end
+
+	-- FOV suave
+	camera.FieldOfView += (targetFov - camera.FieldOfView) * smooth(6, dt)
+	if not isFlying and math.abs(targetFov - CONFIG.FOV_NORMAL) > 0.01 then
+		targetFov += (CONFIG.FOV_NORMAL - targetFov) * smooth(8, dt)
+	end
+
+	-- Tremor de câmera
+	if humanoid and humanoid.Parent then
+		if shakeIntensity > 0.001 then
+			humanoid.CameraOffset = Vector3.new(
+				(math.random() - 0.5) * shakeIntensity,
+				(math.random() - 0.5) * shakeIntensity,
+				(math.random() - 0.5) * shakeIntensity
+			)
+			shakeIntensity *= math.exp(-10 * dt)
+		elseif humanoid.CameraOffset ~= Vector3.zero then
+			humanoid.CameraOffset = Vector3.zero
+			shakeIntensity = 0
+		end
+	end
+
+	updateCooldownBar()
+end)
+
+------------------------------------------------------------
+-- INICIALIZAÇÃO
+------------------------------------------------------------
+buildUI()
+if player.Character then
+	task.spawn(onCharacterAdded, player.Character)
+end
+player.CharacterAdded:Connect(onCharacterAdded)
